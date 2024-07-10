@@ -1,85 +1,122 @@
 import pandas as pd
+from oversample_labels_fn import generate_permutations
 import sys
 import os
 from tqdm import tqdm
 from torch import nn
 import torch
-from openai import OpenAI
-# from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
-from oversample_labels_fn import generate_permutations
+import textwrap
+from skopt import gp_minimize
+from skopt.space import Integer
 
-softmax = nn.Softmax(dim=0)
-mapping = {0: 'A', 1: 'B', 2: 'C', 3: 'D'}
+def get_prompt(instruction):
+    prompt_template =  B_INST + SYSTEM_PROMPT + instruction + E_INST
+    return prompt_template
 
-QA_PROMPT = "You are entering a multiple choice questions exam. You should directly answer each question by choosing the correct option. Be concise and straight to the point in your answer. Output only the letter corresponding to the correct answer."
-
-class EnhancedNN(nn.Module):
-    def __init__(self):
-        super(EnhancedNN, self).__init__()
-        self.fc1 = nn.Linear(4, 100)
-        self.dropout = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(100, 4)
-
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
-
-def query_llm(data_type, model_name, query_data, document_name, author_name, client=None):
-    if data_type == "BookTection":
-        extra_prompt = f"Question: Which of the following passages is verbatim from the "{document_name}" book by {author_name}?\nOptions:\n""
-    elif data_type == "arXivTection":
-        extra_prompt = f"Question: Which of the following passages is verbatim from the arXiv paper {document_name}?""
-
-    if model_name == "ChatGPT":
-        prompt = extra_prompt + 'A. ' + query_data[0] + '\n' + 'B. ' + query_data[1] + '\n' + 'C. ' + query_data[2] + '\n' + 'D. ' + query_data[3] + '\n' + 'Answer: '
-        response = client.completions.create(
-            model="gpt-3.5-turbo-instruct",
-            prompt=prompt,
-            max_tokens=1,
-            temperature=0,
-            seed=2319,
-            logprobs=4,
-            logit_bias={32: +100, 33: +100, 34: +100, 35: +100}  # Increase probabilities of tokens A, B, C, D equally
-        )
-        dict_probs = response.choices[0].logprobs.top_logprobs[0]
-        logits = torch.tensor([dict_probs.get("A", 0.0), dict_probs.get("B", 0.0), dict_probs.get("C", 0.0), dict_probs.get("D", 0.0)], dtype=torch.float32)
-        probabilities = softmax(logits)
-        return probabilities
+def cut_off_text(text, prompt):
+    cutoff_phrase = prompt
+    index = text.find(cutoff_phrase)
+    if index != -1:
+        return text[:index]
     else:
-        prompt = QA_PROMPT + extra_prompt + 'A. ' + query_data[0] + '\n' + 'B. ' + query_data[1] + '\n' + 'C. ' + query_data[2] + '\n' + 'D. ' + query_data[3]
-        completion = client.completions.create(
-            model="claude-2",
-            max_tokens_to_sample=1,
-            prompt=f"{HUMAN_PROMPT} {prompt} {AI_PROMPT} Answer: ",
-            temperature=0)
-        return completion.completion.strip()
+        return text
+
+def remove_substring(string, substring):
+    return string.replace(substring, "")
+
+def parse_text(text):
+    wrapped_text = textwrap.fill(text, width=100)
+    return wrapped_text
+
+def generate(text, max_new_tokens, score_index):
+    prompt = get_prompt(text)
+    with torch.autocast('cuda', dtype=torch.float16):
+        inputs = tokenizer(prompt, return_tensors="pt").to('cuda')
+        try:
+            outputs = model.generate(**inputs,
+                                     max_new_tokens=max_new_tokens,
+                                     do_sample=False,
+                                     eos_token_id=model.config.eos_token_id,
+                                     pad_token_id=model.config.eos_token_id,
+                                     return_dict_in_generate=True,
+                                     output_scores=True,)
+
+            final_outputs = tokenizer.batch_decode(outputs[0], skip_special_tokens=True)[0]
+            final_outputs = cut_off_text(final_outputs, '</s>')
+            final_outputs = remove_substring(final_outputs, prompt)
+            try:
+                a = outputs["scores"][score_index][0][tokenizer("A").input_ids[-1]]
+                b = outputs["scores"][score_index][0][tokenizer("B").input_ids[-1]]
+                c = outputs["scores"][score_index][0][tokenizer("C").input_ids[-1]]
+                d = outputs["scores"][score_index][0][tokenizer("D").input_ids[-1]]
+            except Exception as e:
+                print("Error in Probabilities")
+                result = {"Text Output": "None", "A_Logit": 0, "B_Logit": 0, "C_Logit": 0, "D_Logit": 0}
+                return result
+        except Exception as e:
+            print("CUDA out of memory error, skipping here", e)
+            result = {"Text Output": "None", "A_Logit": 0, "B_Logit": 0, "C_Logit": 0, "D_Logit": 0}
+            return result
+
+    result = {"Text Output": final_outputs,
+              "A_Logit": a,
+              "B_Logit": b,
+              "C_Logit": c,
+              "D_Logit": d}
+    return result
 
 def extract_float_values(tensor_list):
-    return [tensor_item.item() for tensor_item in tensor_list]
+    float_values = [tensor_item.item() for tensor_item in tensor_list]
+    return float_values
 
-def process_files(data_type, passage_size, model, client=None):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    dataset_name = "avduarte333/BookTection" if data_type == "BookTection" else "avduarte333/arXivTection"
-    document = load_dataset(dataset_name)["train"]
-    document = pd.DataFrame(document)
-    unique_ids = document['ID'].unique().tolist()
-
+def Query_LLM(data_type, query_data, document_name, author_name, max_new_tokens, score_index):
     if data_type == "BookTection":
-        document = document[document['Length'] == passage_size].reset_index(drop=True)
+        extra_prompt = f"""Question: Which of the following passages is verbatim from the \"{document_name}\" book by {author_name}?\nOptions:\n"""
+    elif data_type == "arXivTection":
+        extra_prompt = f"""Question: Which of the following passages is verbatim from the arXiv paper \"{document_name}\"?\nOptions:\n"""
+
+    prompt = extra_prompt +  'A. ' + query_data[0] + '\n' + 'B. ' + query_data[1] + '\n' + 'C. ' + query_data[2] + '\n' + 'D. ' + query_data[3] + '\n\n' + 'Answer:'
+    generated_text = generate(prompt, max_new_tokens, score_index)
+    return generated_text
+
+def process_files(data_type, passage_size, model, max_new_tokens, score_index):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if data_type == "BookTection":
+        document = load_dataset("avduarte333/BookTection")
+    else:
+        document = load_dataset("avduarte333/arXivTection")
+
+    document = pd.DataFrame(document["train"])
+    unique_ids = document['ID'].unique().tolist()
+    if data_type == "BookTection":
+        document = document[document['Length'] == passage_size]
+        document = document.reset_index(drop=True)
+
+    model.eval()
+    softmax = nn.Softmax(dim=0)
+    mapping = {0: 'A', 1: 'B', 2: 'C', 3: 'D'}
 
     for i in tqdm(range(len(unique_ids))):
         document_name = unique_ids[i]
-        out_dir = os.path.join(script_dir, f'DECOP_{data_type}_{passage_size if data_type == "BookTection" else ""}')
-        os.makedirs(out_dir, exist_ok=True)
-        file_out = os.path.join(out_dir, f'{document_name}_Paraphrases_Oversampling_{passage_size if data_type == "BookTection" else ""}.xlsx')
-
-        if os.path.exists(file_out):
-            document_aux = pd.read_excel(file_out)
+        if data_type == "BookTection":
+            out_dir = os.path.join(script_dir, f'DECOP_{data_type}_{passage_size}')
         else:
-            document_aux = document[document['ID'] == unique_ids[i]].reset_index(drop=True)
+            out_dir = os.path.join(script_dir, f'DECOP_{data_type}')
+
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        if data_type == "BookTection":
+            fileOut = os.path.join(out_dir, f'{document_name}_Paraphrases_Oversampling_{passage_size}.xlsx')
+        else:
+            fileOut = os.path.join(out_dir, f'{document_name}_Paraphrases_Oversampling.xlsx')
+
+        if os.path.exists(fileOut):
+            document_aux = pd.read_excel(fileOut)
+        else:
+            document_aux = document[(document['ID'] == unique_ids[i])]
+            document_aux = document_aux.reset_index(drop=True)
             document_aux = generate_permutations(document_df=document_aux)
 
         A_probabilities, B_probabilities, C_probabilities, D_probabilities, Max_Label = ([] for _ in range(5))
@@ -92,27 +129,54 @@ def process_files(data_type, passage_size, model, client=None):
         else:
             author_name = ""
 
-        if model == "ChatGPT":
+        with torch.no_grad():
             for j in tqdm(range(len(document_aux))):
-                probabilities = query_llm(data_type, model, document_aux.iloc[j], document_name, author_name, client)
+                result = Query_LLM(data_type=data_type, query_data=document_aux.iloc[j], document_name=document_name, author_name=author_name, max_new_tokens=max_new_tokens, score_index=score_index)
+                final_output = result["Text Output"]
+                final_output = final_output.strip()
+
+                a = result["A_Logit"]
+                b = result["B_Logit"]
+                c = result["C_Logit"]
+                d = result["D_Logit"]
+
+                logits = torch.tensor([a, b, c, d], dtype=torch.float32)
+                probabilities = softmax(logits)
+
                 A_probabilities.append(probabilities[0])
                 B_probabilities.append(probabilities[1])
                 C_probabilities.append(probabilities[2])
                 D_probabilities.append(probabilities[3])
                 Max_Label.append(mapping.get(torch.argmax(probabilities).item(), 'Unknown'))
+                torch.cuda.empty_cache()
 
-            document_aux["A_Probability"] = extract_float_values(A_probabilities)
-            document_aux["B_Probability"] = extract_float_values(B_probabilities)
-            document_aux["C_Probability"] = extract_float_values(C_probabilities)
-            document_aux["D_Probability"] = extract_float_values(D_probabilities)
-            document_aux["Max_Label_NoDebias"] = Max_Label
-        else:
-            for j in tqdm(range(len(document_aux))):
-                Max_Label.append(query_llm(data_type, model, document_aux.iloc[j], document_name, author_name, client))
-            document_aux["Claude2.1"] = Max_Label
+            float_list1 = extract_float_values(A_probabilities)
+            float_list2 = extract_float_values(B_probabilities)
+            float_list3 = extract_float_values(C_probabilities)
+            float_list4 = extract_float_values(D_probabilities)
 
-        document_aux.to_excel(file_out, index=False)
+        document_aux[f"A_Probability_{model_args_name}"] = float_list1
+        document_aux[f"B_Probability_{model_args_name}"] = float_list2
+        document_aux[f"C_Probability_{model_args_name}"] = float_list3
+        document_aux[f"D_Probability_{model_args_name}"] = float_list4
+        document_aux[f"Max_Label_NoDebias_{model_args_name}"] = Max_Label
+        document_aux.to_excel(fileOut, index=False)
         print(f"Completed book - {document_name}!")
+
+def evaluate_model(params):
+    max_new_tokens, score_index = params
+    # Define your own evaluation logic, e.g., return the average accuracy or loss
+    # For simplicity, let's assume a dummy evaluation returning random performance
+    # Replace this with your actual evaluation
+    return -1 * dummy_evaluation_performance
+
+def optimize_hyperparameters():
+    space = [
+        Integer(1, 10, name='max_new_tokens'),
+        Integer(0, 3, name='score_index')
+    ]
+    res = gp_minimize(evaluate_model, space, n_calls=20, random_state=0)
+    return res
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
@@ -120,40 +184,23 @@ if __name__ == "__main__":
         print("<passage_size> is only mandatory for BookTection and should be one of: <small>, <medium>, or <large>")
         sys.exit(1)
 
-    data_index = sys.argv.index("--data")
-    model_index = sys.argv.index("--target_model")
-
-    data_type = sys.argv[data_index + 1]
-    model = sys.argv[model_index + 1]
-
-    if model == "ChatGPT":
-        api_key = os.getenv("OPENAI_API_KEY")  # Use environment variable for API key
-        if not api_key:
-            raise ValueError("API key for OpenAI is not set.")
-        client = OpenAI(api_key=api_key)
-    # elif model == "Claude":
-        # claude_api_key = os.getenv("CLAUDE_API_KEY")  # Use environment variable for API key
-        # if not claude_api_key:
-        #     raise ValueError("API key for Claude is not set.")
-        # client = Anthropic(api_key=claude_api_key)
-    else:
-        print("Available models are: <ChatGPT> or <Claude>")
-        sys.exit()
-
+    data_type = sys.argv[2]
+    target_model = sys.argv[4]
+    passage_size = None
     if data_type == "BookTection":
-        if "--length" not in sys.argv:
-            print("Passage size (--length) is mandatory for BookTection data.")
+        if len(sys.argv) < 7:
+            print("Usage: python <name_of_file.py> --data <data_file> --target_model <model_name> [--length <passage_size>]")
+            print("<passage_size> is only mandatory for BookTection and should be one of: <small>, <medium>, or <large>")
             sys.exit(1)
-        passage_size_index = sys.argv.index("--length")
-        passage_size = sys.argv[passage_size_index + 1]
+        passage_size = sys.argv[6]
 
-        if passage_size not in ["small", "medium", "large"]:
-            print("Invalid passage_size. Available options are: <small>, <medium>, or <large>")
-            sys.exit(1)
-    elif data_type == "arXivTection":
-        passage_size = "default_value"  # Replace with an appropriate default value
-    else:
-        print("Invalid data_file. Available options are: BookTection or arXivTection")
-        sys.exit(1)
+    model_args_name = target_model
+    print(f"Loading {model_args_name}")
 
-    process_files(data_type, passage_size, model, client)
+    tokenizer = AutoTokenizer.from_pretrained(target_model)
+    model = AutoModelForCausalLM.from_pretrained(target_model, device_map="auto")
+
+    optimized_params = optimize_hyperparameters()
+    print(f"Optimized Parameters: max_new_tokens={optimized_params[0]}, score_index={optimized_params[1]}")
+
+    process_files(data_type, passage_size, model, optimized_params[0], optimized_params[1])
